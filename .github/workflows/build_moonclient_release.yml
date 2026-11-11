@@ -1,0 +1,167 @@
+name: Build & Publish MoonClient Release (1-Click Public Releases)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Release Version Tag (e.g., v0.7.8-moon)'
+        required: true
+        default: 'v0.7.8-moon'
+        type: string
+      build_all_abis:
+        description: 'Build all 4 architectures (arm64-v8a, armeabi-v7a, x86_64, x86) or only arm64-v8a?'
+        required: true
+        default: 'arm64-v8a-only (Fast ~12 min)'
+        type: choice
+        options:
+          - 'arm64-v8a-only (Fast ~12 min)'
+          - 'all-4-abis (Full Starling-style Release)'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release-moonclient:
+    name: Build & Publish MoonClient Public Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up JDK 21 & Gradle 8.14
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle 8.14
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14'
+
+      - name: Install Android SDK Platform 35 & NDK
+        run: |
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME" -name sdkmanager -type f | head -n 1)"
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+      - name: Install Rust Toolchain & Android Targets
+        run: |
+          rustup show active-toolchain || rustup toolchain install 1.95.0
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - name: Apply MoonClient Rebrand, Midnight Black Theme, Smooth 60FPS UI & .jar Fallback
+        run: |
+          python3 - << 'EOF'
+          import re
+          from pathlib import Path
+
+          root = Path(".")
+
+          def patch_regex(path: Path, rules):
+              if not path.exists():
+                  return
+              txt = path.read_text(encoding="utf-8", errors="ignore")
+              new_txt = txt
+              for pat, rep in rules:
+                  new_txt = re.sub(pat, rep, new_txt)
+              if new_txt != txt:
+                  path.write_text(new_txt, encoding="utf-8")
+                  print(f"Patched: {path}")
+
+          # 1. Rebrand Horizon Android / Starling -> MoonClient
+          for gradle in root.rglob("*.gradle*"):
+              patch_regex(gradle, [
+                  (r"Horizon Android", "MoonClient"),
+                  (r"Starling", "MoonClient"),
+              ])
+          for manifest in root.rglob("AndroidManifest.xml"):
+              patch_regex(manifest, [
+                  (r'android:label="Horizon[^"]*"', 'android:label="MoonClient"'),
+                  (r'android:label="Starling[^"]*"', 'android:label="MoonClient"'),
+              ])
+
+          # 2. Apply Pure AMOLED Midnight Black Theme (#000000, #08080C, #12121A, #38BDF8)
+          #    and 16ms smooth transition frame pacing
+          theme_rules = [
+              (r'"Horizon Android"', '"MoonClient"'),
+              (r'"Horizon Android ', '"MoonClient '),
+              (r'"Starling"', '"MoonClient"'),
+              (r"(?i)#0D0C14", "#000000"),
+              (r"(?i)#171622", "#08080C"),
+              (r"(?i)#252336", "#12121A"),
+              (r"(?i)#5B4898", "#1E293B"),
+              (r"(?i)#9A7BFF", "#38BDF8"),
+              (r"0x0[dD],\s*0x0[cC],\s*0x14", "0x00, 0x00, 0x00"),
+              (r"0x17,\s*0x16,\s*0x22", "0x08, 0x08, 0x0C"),
+              (r"0x25,\s*0x23,\s*0x36", "0x12, 0x12, 0x1A"),
+              (r"0x5[bB],\s*0x48,\s*0x98", "0x1E, 0x29, 0x3B"),
+              (r"0x9[aA],\s*0x7[bB],\s*0x[fF][fF]", "0x38, 0xBD, 0xF8"),
+              (r"Duration::from_millis\(33\)", "Duration::from_millis(16)"),
+              (r"browsing-only", "installable (.jar content + .hmod)"),
+          ]
+          for folder in [root / "crates", root / "launcher"]:
+              if folder.exists():
+                  for f in folder.rglob("*"):
+                      if f.suffix in {".rs", ".css", ".json"}:
+                          patch_regex(f, theme_rules)
+          EOF
+
+      - name: Prepare Engine Tables & Build Public MoonClient APK(s)
+        run: |
+          mkdir -p release_assets
+          python3 tools/android_prepare.py
+
+          if [ "${{ inputs.build_all_abis }}" = "all-4-abis (Full Starling-style Release)" ]; then
+            ABIS="arm64-v8a armeabi-v7a x86_64 x86"
+          else
+            ABIS="arm64-v8a"
+          fi
+
+          for ABI in $ABIS; do
+            python3 tools/android_build.py --abi "$ABI" --public
+            cp ".local/android/apk/${ABI}/horizon-android-public.apk" "release_assets/MoonClient-0.7.8-${ABI}.apk"
+          done
+
+          cp LICENSE release_assets/LICENSE.txt || true
+          cp THIRD_PARTY_NOTICES.md release_assets/THIRD_PARTY_NOTICES.md || true
+          cd release_assets
+          sha256sum MoonClient-*.apk > SHA256SUMS.txt
+
+      - name: Upload Artifact Backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoonClient-0.7.8-Release-Bundle
+          path: release_assets/*
+
+      - name: Publish Public GitHub Release on Your Repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'EOF' > release_notes.md
+          # 🌙 MoonClient 0.7.8 (Midnight Black Edition)
+
+          **MoonClient** is a customized Rust-powered Android port of Minecraft: Java Edition 26.3 (built on Horizon / Starling).
+
+          ### ✨ What's New in MoonClient 0.7.8
+          - **MoonClient Rebrand & Pure AMOLED Midnight Black Theme**: Deep `#000000` black backgrounds, `#08080C` obsidian surfaces, `#12121A` cards, and `#38BDF8` ice-blue accents.
+          - **Ultra-Smooth 60+ FPS UI Transitions**: Locked `16ms` launcher frame pacing with smooth page slide/fade transitions.
+          - **Offline Account & 3D Skin Wardrobe**: Full Offline Account support (16-char names) + local PNG Skin & Cape import with rotatable 3D Classic/Slim preview, plus Microsoft & Ely.by sign-in.
+          - **Mod Support (`.hmod`, `.hnmod` & `.jar` Content/Data Packs)**: Native Rust `.hmod` & `.hnmod` mods, built-in Zoom/Minimap/Recipes/SmartF3, and Modrinth `.jar` asset/data-pack fallback extraction.
+          EOF
+
+          gh release create "${{ inputs.version_tag }}" release_assets/* \
+            --title "MoonClient 0.7.8" \
+            --notes-file release_notes.md || \
+          gh release upload "${{ inputs.version_tag }}" release_assets/* --clobber
